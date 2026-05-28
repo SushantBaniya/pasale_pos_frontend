@@ -1,0 +1,437 @@
+import React, { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuthStore } from '../../store/authStore';
+import { useBusinessStore } from '../../store/businessStore';
+import { reportApi, inventoryApi, reminderApi, billingApi } from '../../utils/api';
+import { ReminderModal } from '../../components/dashboard/ReminderModal';
+import {
+  FiTrendingUp, FiLayers, FiPackage, FiShoppingCart,
+  FiPlus, FiBell, FiSearch
+} from 'react-icons/fi';
+
+//  Format helpers 
+const formatRupees = (n: number) => {
+  if (n >= 10000000) return `Rs. ${(n / 10000000).toFixed(1)}Cr`;
+  if (n >= 100000) return `Rs. ${(n / 100000).toFixed(1)}L`;
+  if (n >= 1000) return `Rs. ${(n / 1000).toFixed(1)}k`;
+  return `Rs. ${new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n)}`;
+};
+
+const formatFull = (n: number) => {
+  return `Rs. ${new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n)}`;
+};
+
+//  KPI Card Component 
+interface KpiCardProps {
+  label: string;
+  value: string | number;
+  icon: React.ReactNode;
+  iconBg: string;
+  iconColor: string;
+}
+
+const KpiCard: React.FC<KpiCardProps> = ({ label, value, icon, iconBg, iconColor }) => (
+  <div className="bg-white dark:bg-[#15161C] border border-[#E2E8F0] dark:border-[#2A2B36] rounded-xl p-5 flex justify-between items-center shadow-sm hover:shadow-md transition-shadow cursor-pointer min-w-0">
+    <div style={{ width: 48, height: 48, borderRadius: 12, background: iconBg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, color: iconColor }}>
+      {icon}
+    </div>
+    <div className="text-right overflow-hidden ml-3">
+      <p className="text-[10px] xl:text-[11px] font-semibold text-[#94A3B8] dark:text-[#64748B] tracking-wider uppercase mb-1 truncate">{label}</p>
+      <p className="text-2xl sm:text-3xl font-light text-[#111827] dark:text-[#EAE5DF] leading-none truncate">{value}</p>
+    </div>
+  </div>
+);
+
+//  Main Dashboard 
+export default function DashboardPage() {
+  const navigate = useNavigate();
+  const { userProfile } = useAuthStore();
+  const { businessName } = useBusinessStore();
+
+  const [dashboardData, setDashboardData] = useState<any>(null);
+  const [stockAlerts, setStockAlerts] = useState<any[]>([]);
+  const [summaryLoading, setSummaryLoading] = useState(true);
+  const [reminders, setReminders] = useState<any[]>([]);
+  const [isReminderModalOpen, setIsReminderModalOpen] = useState(false);
+  const [currentTime, setCurrentTime] = useState(new Date());
+
+  const [billings, setBillings] = useState<any[]>([]);
+  const [billingsLoading, setBillingsLoading] = useState(false);
+  const [ordersSearch, setOrdersSearch] = useState('');
+
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 60000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const handleAddReminder = async (data: any) => {
+    try {
+      const res = await reminderApi.addReminder(data);
+      if (res.data) {
+        setReminders([...reminders, res.data]);
+      }
+    } catch (error) {
+      console.error('Error adding reminder:', error);
+    }
+  };
+
+  const getUserName = (): string => {
+    if (userProfile?.name && userProfile.name !== 'Demo User Admin') return userProfile.name;
+    if (businessName) return businessName;
+    if (userProfile?.businessName) return userProfile.businessName;
+    if (userProfile?.email) return userProfile.email.split('@')[0];
+    return 'User';
+  };
+
+  // Fetch core summary data (critical for first paint)
+  useEffect(() => {
+    let isMounted = true;
+    const fetchSummary = async () => {
+      setSummaryLoading(true);
+      try {
+        const data = await reportApi.getSummary({ scope: 'dashboard' });
+        if (!isMounted) return;
+        setDashboardData(data);
+      } catch (err) {
+        console.error('Failed to fetch dashboard summary:', err);
+        if (!isMounted) return;
+        setDashboardData({
+          dashboard: {
+            to_receive: 0, to_give: 0, monthly_sales: 0, monthly_purchase: 0,
+            inventory_value: 0, current_month_short: new Date().toLocaleString('en', { month: 'short' }).toUpperCase(),
+          }
+        });
+      } finally {
+        if (isMounted) setSummaryLoading(false);
+      }
+    };
+
+    fetchSummary();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Fetch reminders/alerts in the background so they don't block initial load
+  useEffect(() => {
+    let isMounted = true;
+    const fetchSideData = async () => {
+      try {
+        const [alertsResponse, remindersResponse] = await Promise.all([
+          inventoryApi.getAlerts().catch(() => ({})),
+          reminderApi.getReminders().catch(() => ({ data: [] })),
+        ]);
+
+        if (!isMounted) return;
+
+        if (remindersResponse?.data) {
+          setReminders(remindersResponse.data);
+        }
+
+        let alertsArray: any[] = [];
+        if (Array.isArray(alertsResponse)) alertsArray = alertsResponse;
+        else if (alertsResponse && Array.isArray(alertsResponse.alerts)) alertsArray = alertsResponse.alerts;
+        else if (alertsResponse && alertsResponse.data && Array.isArray(alertsResponse.data.alerts)) alertsArray = alertsResponse.data.alerts;
+
+        setStockAlerts(alertsArray);
+      } catch (err) {
+        console.error('Failed to fetch dashboard side data:', err);
+      }
+    };
+
+    fetchSideData();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Fetch Billings for Orders Table
+  useEffect(() => {
+    let isMounted = true;
+    const fetchBillings = async () => {
+      setBillingsLoading(true);
+      try {
+        const billingsRes = await billingApi.getAll();
+        if (!isMounted) return;
+        const records = billingsRes.results || billingsRes || [];
+        const sorted = [...records].sort((a: any, b: any) => {
+          const dateA = new Date(a.invoice_date || a.created_at || 0).getTime();
+          const dateB = new Date(b.invoice_date || b.created_at || 0).getTime();
+          return dateB - dateA;
+        });
+        setBillings(sorted);
+      } catch (err) {
+        console.error('Failed to fetch billings for dashboard:', err);
+      } finally {
+        if (isMounted) setBillingsLoading(false);
+      }
+    };
+
+    fetchBillings();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const db = dashboardData?.dashboard || {};
+
+  const filteredBillings = billings.filter((b) => {
+    if (!ordersSearch) return true;
+    const search = ordersSearch.toLowerCase();
+    const formattedId = `#${String(b.id).padStart(6, '0')}`;
+    return (
+      formattedId.includes(search) ||
+      b.invoice_number?.toLowerCase().includes(search) ||
+      b.party?.name?.toLowerCase().includes(search) ||
+      b.invoice_status?.toLowerCase().includes(search)
+    );
+  }).slice(0, 10);
+
+  if (summaryLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 border-4 border-[#F8FAFC] border-t-[#F2DD50] rounded-full animate-spin" />
+          <p className="text-sm text-black dark:text-[#44454F] font-medium">Loading dashboard...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-[1300px] mx-auto">
+
+      {/*  Banner  */}
+      <div className="w-full h-32 sm:h-48 rounded-xl bg-gradient-to-r from-[#D7E1EC] to-[#59789F] text-[#0f2142] flex flex-col justify-center px-6 sm:px-10 relative overflow-hidden mb-6 shadow-sm border border-[#E2E8F0] dark:border-[#1C1D24]">
+        {/* Placeholder for the user's banner image, applying a subtle overlay for text readability */}
+        <div className="absolute top-0 right-0 bottom-0 left-0 bg-[url('/nepal-silhouette.png')] bg-cover bg-bottom opacity-20 mix-blend-multiply pointer-events-none"></div>
+        <div className="relative z-10 flex justify-between items-center w-full">
+          <div>
+            <div className="flex items-center gap-3 mb-2 sm:mb-4">
+              <p className="text-[10px] sm:text-xs font-semibold tracking-widest text-[#2B4B70] uppercase">Admin Panel</p>
+              <div className="h-px w-16 bg-[#2B4B70]/40"></div>
+            </div>
+            <h1 className="text-3xl sm:text-5xl font-light tracking-wide text-[#0B1B3D]">Welcome back, {getUserName()}</h1>
+          </div>
+          <div className="text-right hidden sm:block">
+            <p className="text-[10px] sm:text-xs font-semibold text-[#2B4B70] uppercase mb-1 tracking-widest">U240745</p>
+            <div className="flex items-baseline justify-end gap-1.5">
+              <p className="text-5xl sm:text-6xl font-light tracking-wider text-[#18355C]">
+                {currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }).split(' ')[0]}
+              </p>
+              <p className="text-xl sm:text-2xl font-light text-[#2B4B70]">
+                {currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }).split(' ')[1]}
+              </p>
+            </div>
+            <p className="text-[10px] sm:text-xs font-medium text-[#3E5C7E] uppercase mt-2 tracking-widest">
+              {currentTime.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/*  KPI Cards  */}
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4 mb-6">
+        <KpiCard
+          label={`SALES (${db.current_month_short || 'MTH'})`}
+          value={formatFull(db.monthly_sales || 0).replace('Rs. ', '')}
+          icon={<FiTrendingUp size={24} />}
+          iconBg="#FFF7ED"
+          iconColor="#F97316"
+        />
+        <KpiCard
+          label={`PURCHASE (${db.current_month_short || 'MTH'})`}
+          value={formatFull(db.monthly_purchase || 0).replace('Rs. ', '')}
+          icon={<FiShoppingCart size={24} />}
+          iconBg="#F0FDF4"
+          iconColor="#10B981"
+        />
+        <KpiCard
+          label="INVENTORY"
+          value={formatFull(db.inventory_value || 0).replace('Rs. ', '')}
+          icon={<FiPackage size={24} />}
+          iconBg="#EFF6FF"
+          iconColor="#3B82F6"
+        />
+        <KpiCard
+          label="TOTAL ORDERS"
+          value={billings.length}
+          icon={<FiLayers size={24} />}
+          iconBg="#FAF5FF"
+          iconColor="#8B5CF6"
+        />
+      </div>
+
+      {/*  Main Layout: Orders Table + Right Panel  */}
+      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 mb-6">
+
+        {/* Orders Table */}
+        <div className="bg-white dark:bg-[#15161C] border border-[#E2E8F0] dark:border-[#2A2B36] rounded-xl overflow-hidden flex flex-col shadow-sm">
+          <div className="px-6 py-5 border-b border-[#E2E8F0] dark:border-[#1C1D24]/50 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+            <h2 className="text-[17px] font-semibold text-[#111827] dark:text-[#EAE5DF]">Orders</h2>
+            <div className="relative w-full sm:w-80">
+              <FiSearch className="absolute left-3.5 top-1/2 transform -translate-y-1/2 text-[#94A3B8] w-4 h-4" />
+              <input
+                type="text"
+                placeholder="Search by order, table, status"
+                value={ordersSearch}
+                onChange={(e) => setOrdersSearch(e.target.value)}
+                className="w-full pl-10 pr-4 py-2 border border-[#E2E8F0] dark:border-[#2A2B36] rounded-lg bg-white dark:bg-[#1C1D24] text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 placeholder:text-[#94A3B8] transition-shadow text-[#111827]"
+              />
+            </div>
+          </div>
+
+          <div className="overflow-x-auto flex-1">
+            <table className="w-full text-left border-collapse min-w-[600px]">
+              <thead>
+                <tr className="border-b border-[#E2E8F0] dark:border-[#1C1D24]/50 bg-white dark:bg-[#1C1D24]/30">
+                  <th className="px-6 py-4 text-[11px] font-bold text-[#64748B] dark:text-[#44454F] uppercase tracking-widest w-[20%]">Order</th>
+                  <th className="px-6 py-4 text-[11px] font-bold text-[#64748B] dark:text-[#44454F] uppercase tracking-widest w-[20%]">Location</th>
+                  <th className="px-6 py-4 text-[11px] font-bold text-[#64748B] dark:text-[#44454F] uppercase tracking-widest w-[20%]">Status</th>
+                  <th className="px-6 py-4 text-[11px] font-bold text-[#64748B] dark:text-[#44454F] uppercase tracking-widest w-[20%]">Created At</th>
+                  <th className="px-6 py-4 text-[11px] font-bold text-[#64748B] dark:text-[#44454F] uppercase tracking-widest text-right w-[20%]">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {billingsLoading ? (
+                  <tr>
+                    <td colSpan={5} className="py-16 text-center text-sm text-black dark:text-[#44454F] bg-white dark:bg-[#15161C]">
+                      Loading orders...
+                    </td>
+                  </tr>
+                ) : filteredBillings.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="py-16 text-center text-sm text-[#64748B] dark:text-[#44454F] bg-white dark:bg-[#15161C]">
+                      No orders found.
+                    </td>
+                  </tr>
+                ) : (
+                  filteredBillings.map((billing) => (
+                    <tr
+                      key={billing.id}
+                      className="border-b border-gray-50 dark:border-[#1C1D24] hover:bg-slate-50 dark:hover:bg-gray-800/50 cursor-pointer transition-colors"
+                      onClick={() => navigate(`/billing?billingId=${billing.id}`)}
+                    >
+                      <td className="px-5 py-4 font-medium text-black dark:text-[#EAE5DF] text-sm">
+                        #{String(billing.id).padStart(6, '0')}
+                        <div className="text-[11px] font-medium text-slate-400 mt-0.5">{billing.invoice_number || '-'}</div>
+                      </td>
+                      <td className="px-5 py-4 font-medium text-black dark:text-[#EAE5DF] text-sm">
+                        {billing.party?.name || 'Walk-in Customer'}
+                      </td>
+                      <td className="px-5 py-4">
+                        <span className={`px-2.5 py-1 text-[10px] font-medium rounded-full uppercase tracking-wide ${billing.invoice_status?.toLowerCase() === 'paid'
+                            ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                            : 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
+                          }`}>
+                          {billing.invoice_status || 'PENDING'}
+                        </span>
+                      </td>
+                      <td className="px-5 py-4 font-medium text-black dark:text-[#EAE5DF] text-xs">
+                        {new Date(billing.invoice_date || billing.created_at || Date.now()).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).toUpperCase()}
+                      </td>
+                      <td className="px-5 py-4 font-black text-[#10B981] text-sm text-right">
+                        Rs. {Number(billing.total_amount || 0).toLocaleString()}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Right Panel  Reminders & Alerts */}
+        <div className="space-y-4">
+          {/* Stock Alerts */}
+          <div className="bg-white dark:bg-[#15161C] border border-[#CBD5E1] dark:border-[#2A2B36] rounded-xl p-5 shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-medium text-black dark:text-[#EAE5DF]">
+                Stock Alerts
+              </h3>
+            </div>
+
+            {stockAlerts.length === 0 ? (
+              <div className="flex flex-col items-center py-4 text-center">
+                <FiPackage className="w-8 h-8 text-[#E2E8F0] dark:text-gray-700 mb-2" />
+                <p className="text-sm font-medium text-black dark:text-[#44454F] mb-1">All Good!</p>
+                <p className="text-xs text-black dark:#475569">No items are running out of stock.</p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3 max-h-[160px] overflow-y-auto pr-1">
+                {stockAlerts.map((alert: any, idx: number) => (
+                  <div key={alert.id || idx} className="flex justify-between items-center bg-white dark:bg-[#1C1D24] border border-[#E2E8F0] dark:border-[#2A2B36] p-3 rounded-lg">
+                    <div>
+                      <p className="text-xs font-medium text-black dark:text-[#64748B] line-clamp-1">
+                        {alert.product_name || alert.message || 'Unknown Product'}
+                      </p>
+                      <p className="text-[11px] text-red-500 dark:text-red-400 mt-0.5 font-medium line-clamp-1">
+                        {alert.message || (alert.product_quantity === 0 ? 'Out of Stock' : 'Low Stock')}
+                      </p>
+                    </div>
+                    <div className="text-right whitespace-nowrap pl-2">
+                      <p className="text-sm font-medium text-black dark:text-[#EAE5DF]">{alert.product_quantity ?? 0}</p>
+                      <p className="text-[10px] text-black dark:text-[#44454F]">Qty left</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Upcoming Reminders */}
+          <div className="bg-white dark:bg-[#15161C] border border-[#CBD5E1] dark:border-[#2A2B36] rounded-xl p-5 shadow-sm">
+            <h3 className="text-sm font-medium text-black dark:text-[#EAE5DF] mb-4">Upcoming Reminders ({reminders.length})</h3>
+            {reminders.length === 0 ? (
+              <div className="flex flex-col items-center py-6 text-center">
+                <FiBell className="w-10 h-10 text-[#E2E8F0] dark:text-gray-700 mb-3" />
+                <p className="text-sm font-medium text-black dark:text-[#44454F] mb-1">
+                  Reminder Not Created Yet!
+                </p>
+                <p className="text-xs text-black dark:text-[#44454F] mb-4">
+                  Looks like you haven't created any reminders yet.
+                </p>
+                <button
+                  onClick={() => setIsReminderModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 text-[#F2DD50] dark:text-[#F2DD50] text-sm font-medium hover:text-[#8E7356] dark:hover:text-[#8E7356] transition-colors"
+                >
+                  <FiPlus className="w-4 h-4" /> Add New Reminder
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {reminders.map((reminder) => (
+                  <div key={reminder.id} className="p-3 bg-[#F7FAFC] dark:bg-[#1C1D24] rounded-lg flex items-center justify-between border border-[#E2E8F0] dark:border-[#2A2B36]">
+                    <div>
+                      <h4 className="text-sm font-medium text-black dark:text-[#EAE5DF]">{reminder.title}</h4>
+                      {reminder.description && <p className="text-xs text-black dark:text-[#64748B]">{reminder.description}</p>}
+                    </div>
+                    <div className="text-right">
+                      <span className="text-xs font-medium text-[#F2DD50] dark:text-[#F2DD50]">
+                        {new Date(reminder.due_date).toLocaleDateString()}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+                <div className="flex justify-center mt-2">
+                  <button
+                    onClick={() => setIsReminderModalOpen(true)}
+                    className="inline-flex items-center gap-1.5 text-[#F2DD50] dark:text-[#F2DD50] text-sm font-medium hover:text-[#8E7356] dark:hover:text-[#8E7356] transition-colors"
+                  >
+                    <FiPlus className="w-4 h-4" /> Add New Reminder
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <ReminderModal
+        isOpen={isReminderModalOpen}
+        onClose={() => setIsReminderModalOpen(false)}
+        onAdd={handleAddReminder}
+      />
+    </div>
+  );
+}
